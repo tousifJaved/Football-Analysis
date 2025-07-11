@@ -1,0 +1,7 @@
+*__pycahce__*
+*.pyc
+env/
+models/
+input_videos/
+stubs/
+output_videos/
