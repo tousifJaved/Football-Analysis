@@ -1,88 +1,97 @@
-from sklearn.cluster import KMeans
+import cv2
 import numpy as np
+from sklearn.cluster import KMeans
+from collections import defaultdict, deque
 
 
 class TeamAssigner:
-    def __init__(self):
+    def __init__(self, smoothing_window=15):
         self.team_colors = {}
-        self.player_team_dict = {}
-        self.kmeans = None  # store the KMeans model after fitting
+        self.kmeans = None
+        self.player_history = defaultdict(lambda: deque(maxlen=smoothing_window))
 
+    # Performs Kmeans on AB channels
     def get_clustering_model(self, image):
-        # Reshape the image to 2D array (pixels x 3 color channels)
-        image_2d = image.reshape(-1, 3)
-
-        # Perform K-means with 2 clusters
+        if image.size == 0:
+            return None, None
+        image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        L, A, B = cv2.split(image_lab)
+        mask = (L > 30) & (L < 220)
+        ab = np.stack((A, B), axis=-1)
+        ab_masked = ab[mask]
+        if len(ab_masked) < 50:
+            return None, None
         kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10, random_state=42)
-        kmeans.fit(image_2d)
+        kmeans.fit(ab_masked)
+        return kmeans, mask.shape
 
-        return kmeans
+    # Identify background clusters
+    def filter_background(self, labels_2d):
+        h, w = labels_2d.shape
+        border_pixels = np.concatenate(
+            [
+                labels_2d[0:5, :].flatten(),
+                labels_2d[-5:, :].flatten(),
+                labels_2d[:, 0:5].flatten(),
+                labels_2d[:, -5:].flatten(),
+            ]
+        )
+        border_pixels = border_pixels[border_pixels >= 0]
+        if len(border_pixels) == 0:
+            return 0
+        counts = np.bincount(border_pixels)
+        return np.argmax(counts)
+
+    def ab_to_rgb(self, ab):
+        lab_color = np.zeros((1, 1, 3), dtype=np.uint8)
+        lab_color[0, 0, 0] = 150
+        lab_color[0, 0, 1:] = ab.astype(np.uint8)
+        rgb_color = cv2.cvtColor(lab_color, cv2.COLOR_LAB2BGR)[0, 0]
+        return rgb_color
 
     def get_player_color(self, frame, bbox):
-        # Crop the bounding box area from frame
         x1, y1, x2, y2 = map(int, bbox)
         image = frame[y1:y2, x1:x2]
-
-        # Handle empty or invalid crop
         if image.size == 0:
-            return np.array([0, 0, 0])  # fallback color
+            return np.array([0, 0, 0])
+        image = image[: image.shape[0] // 2, :]
+        kmeans, mask_shape = self.get_clustering_model(image)
+        if kmeans is None:
+            return np.array([0, 0, 0])
+        image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+        L = image_lab[:, :, 0]
+        mask = (L > 30) & (L < 220)
+        labels_2d = np.full(L.shape, -1)
+        labels_2d[mask] = kmeans.labels_
+        background_cluster = self.filter_background(labels_2d)
+        player_cluster = 1 - background_cluster
+        player_color_ab = kmeans.cluster_centers_[player_cluster]
+        return self.ab_to_rgb(player_color_ab)
 
-        # Take top half of the cropped image to focus on jersey
-        top_half_image = image[: image.shape[0] // 2, :]
-
-        # Get clustering model for jersey color clusters
-        kmeans = self.get_clustering_model(top_half_image)
-
-        # Get cluster labels reshaped to image dimensions
-        labels = kmeans.labels_
-        clustered_image = labels.reshape(
-            top_half_image.shape[0], top_half_image.shape[1]
-        )
-
-        # Find the most common cluster at corners (assumed background/non-player)
-        corner_clusters = [
-            clustered_image[0, 0],
-            clustered_image[0, -1],
-            clustered_image[-1, 0],
-            clustered_image[-1, -1],
-        ]
-        non_player_cluster = max(set(corner_clusters), key=corner_clusters.count)
-
-        # Player cluster is the opposite cluster
-        player_cluster = 1 - non_player_cluster
-
-        # Return the RGB center color of the player cluster
-        player_color = kmeans.cluster_centers_[player_cluster]
-
-        return player_color
-
+    # Performs Kmean clustering, stores most 2 dominant colors and their centeroids
     def assign_team_color(self, frame, player_detections):
         player_colors = []
-        for _, player_detection in player_detections.items():
-            bbox = player_detection["bbox"]
-            player_color = self.get_player_color(frame, bbox)
-            player_colors.append(player_color)
-
-        # Fit KMeans to player colors to identify two team clusters
+        for _, detection in player_detections.items():
+            bbox = detection["bbox"]
+            color = self.get_player_color(frame, bbox)
+            player_colors.append(color)
+        if len(player_colors) < 2:
+            return
         kmeans = KMeans(n_clusters=2, init="k-means++", n_init=10, random_state=42)
         kmeans.fit(player_colors)
-
         self.kmeans = kmeans
-
-        # Store team colors for reference
         self.team_colors[1] = kmeans.cluster_centers_[0]
         self.team_colors[2] = kmeans.cluster_centers_[1]
 
-    def get_player_team(self, frame, player_bbox, player_id):
-        # Return cached team if assigned before
-        if player_id in self.player_team_dict:
-            return self.player_team_dict[player_id]
+    def get_player_team(self, frame, player_bbox, player_id=None):
+        if self.kmeans is None:
+            return None
+        color = self.get_player_color(frame, player_bbox)
+        team_id = self.kmeans.predict(color.reshape(1, -1))[0] + 1
+        if player_id is not None:
+            self.player_history[player_id].append(team_id)
 
-        # Predict team based on player color
-        player_color = self.get_player_color(frame, player_bbox)
-        team_id = self.kmeans.predict(player_color.reshape(1, -1))[0] + 1  # 1 or 2
-
-        # Cache the assignment
-        self.player_team_dict[player_id] = team_id
-
+            # Return the most frequent team in the window
+            team_votes = list(self.player_history[player_id])
+            return max(set(team_votes), key=team_votes.count)
         return team_id

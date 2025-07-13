@@ -6,38 +6,30 @@ from trackers import Tracker
 from team_assigner import TeamAssigner
 from player_ball_assigner import PlayerBallAssigner
 
-# Page config
 st.set_page_config(page_title="Football Video Processor", layout="centered")
 st.title("⚽ Football Match Video Processor")
 
-# File upload
 uploaded_file = st.file_uploader("🎥 Upload a video file", type=["mp4", "avi", "mov"])
 
 if uploaded_file is not None:
     st.success("✅ Video uploaded successfully!")
 
-    # Save uploaded file to a temp location
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_input_file:
         temp_input_file.write(uploaded_file.read())
         input_path = temp_input_file.name
 
+    # Show input video preview
     st.video(input_path)
 
     if st.button("🔄 Process Video"):
         with st.spinner("Processing video... Please wait."):
             try:
-                # Step 1: Read video frames
                 video_frames = read_video(input_path)
-
-                # Step 2: Track objects
                 tracker = Tracker("models/best.pt")
                 tracks = tracker.get_object_tracks(video_frames)
-
-                # Step 3: Add object positions and interpolate ball
                 tracker.add_position_to_tracks(tracks)
                 tracks["ball"] = tracker.interpolate_ball_positions(tracks["ball"])
 
-                # Step 4: Assign team colors
                 team_assigner = TeamAssigner()
                 team_assigner.assign_team_color(video_frames[0], tracks["players"][0])
 
@@ -51,7 +43,6 @@ if uploaded_file is not None:
                             team, (255, 255, 255)
                         )
 
-                # Step 5: Assign ball possession
                 player_assigner = PlayerBallAssigner()
                 team_ball_control = []
 
@@ -60,9 +51,8 @@ if uploaded_file is not None:
                     ball_bbox = ball_info.get(1, {}).get("bbox", None)
 
                     if ball_bbox is None:
-                        team_ball_control.append(
-                            team_ball_control[-1] if frame_num > 0 else "None"
-                        )
+                        last = team_ball_control[-1] if frame_num > 0 else "None"
+                        team_ball_control.append(last)
                         continue
 
                     assigned_player = player_assigner.assign_ball_to_player(
@@ -71,38 +61,34 @@ if uploaded_file is not None:
 
                     if assigned_player != -1:
                         tracks["players"][frame_num][assigned_player]["has_ball"] = True
-                        team_ball_control.append(
-                            tracks["players"][frame_num][assigned_player]["team"]
+                        team = tracks["players"][frame_num][assigned_player].get(
+                            "team", "None"
                         )
+                        team_ball_control.append(team)
                     else:
-                        team_ball_control.append(
-                            team_ball_control[-1] if frame_num > 0 else "None"
-                        )
+                        last = team_ball_control[-1] if frame_num > 0 else "None"
+                        team_ball_control.append(last)
 
                 team_ball_control = np.array(team_ball_control)
-
-                # Step 6: Draw annotations
                 output_frames = tracker.draw_annotations(
-                    video_frames, tracks, team_ball_control
+                    video_frames, tracks, team_ball_control, team_assigner
                 )
 
-                # Step 7: Save output to temp file
                 with tempfile.NamedTemporaryFile(
-                    delete=False, suffix=".avi"
+                    delete=False, suffix=".mp4"
                 ) as temp_output_file:
                     output_path = temp_output_file.name
                     save_video(output_frames, output_path)
 
-                # Step 8: Display and download
-                st.success("✅ Processing complete!")
-                st.video(output_path)
-
+                # Final output: show message and download button only
+                st.success("✅ Processing complete! Download your video below.")
                 with open(output_path, "rb") as f:
                     st.download_button(
                         label="⬇ Download Processed Video",
                         data=f.read(),
-                        file_name="processed_video.avi",
-                        mime="video/avi",
+                        file_name="processed_video.mp4",
+                        mime="video/mp4",
                     )
+
             except Exception as e:
-                st.error(f"❌ An error occurred during processing: {str(e)}")
+                st.error(f"❌ An error occurred during processing:\n\n{str(e)}")

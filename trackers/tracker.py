@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 import cv2
 import sys
+from collections import defaultdict
 
 sys.path.append("../")
 from utils import get_center_of_bbox, get_bbox_width, get_foot_position
@@ -13,6 +14,54 @@ class Tracker:
     def __init__(self, model_path):
         self.model = YOLO(model_path)
         self.tracker = sv.ByteTrack()
+
+    def detect_frames(self, frames, batch_size=20):
+        detections = []
+        for i in range(0, len(frames), batch_size):
+            batch = self.model.predict(frames[i : i + batch_size], conf=0.1)
+            detections += batch
+        return detections
+
+    def get_object_tracks(self, frames):
+        detections = self.detect_frames(frames)
+        tracks = {"players": [], "referees": [], "ball": []}
+
+        for frame_num, detection in enumerate(detections):
+            cls_names = detection.names
+            cls_names_inv = {v: k for k, v in cls_names.items()}
+
+            detection_supervision = sv.Detections.from_ultralytics(detection)
+
+            # Merge goalkeeper with players
+            for i, cls_id in enumerate(detection_supervision.class_id):
+                if cls_names[cls_id] == "goalkeeper":
+                    detection_supervision.class_id[i] = cls_names_inv["player"]
+
+            tracked_detections = self.tracker.update_with_detections(
+                detection_supervision
+            )
+
+            tracks["players"].append({})
+            tracks["referees"].append({})
+            tracks["ball"].append({})
+
+            for det in tracked_detections:
+                bbox = det[0].tolist()
+                cls_id = det[3]
+                track_id = det[4]
+
+                if cls_id == cls_names_inv["player"]:
+                    tracks["players"][frame_num][track_id] = {"bbox": bbox}
+                elif cls_id == cls_names_inv["referee"]:
+                    tracks["referees"][frame_num][track_id] = {"bbox": bbox}
+
+            for det in detection_supervision:
+                bbox = det[0].tolist()
+                cls_id = det[3]
+                if cls_id == cls_names_inv["ball"]:
+                    tracks["ball"][frame_num][1] = {"bbox": bbox}
+
+        return tracks
 
     def add_position_to_tracks(self, tracks):
         for object_name, object_tracks in tracks.items():
@@ -44,54 +93,6 @@ class Tracker:
         df = pd.DataFrame(filled_positions, columns=["x1", "y1", "x2", "y2"])
         df = df.interpolate().bfill()
         return [{1: {"bbox": row}} for row in df.to_numpy().tolist()]
-
-    def detect_frames(self, frames, batch_size=20):
-        detections = []
-        for i in range(0, len(frames), batch_size):
-            batch = self.model.predict(frames[i : i + batch_size], conf=0.1)
-            detections += batch
-        return detections
-
-    def get_object_tracks(self, frames):
-        detections = self.detect_frames(frames)
-        tracks = {"players": [], "referees": [], "ball": []}
-
-        for frame_num, detection in enumerate(detections):
-            cls_names = detection.names
-            cls_names_inv = {v: k for k, v in cls_names.items()}
-
-            detection_supervision = sv.Detections.from_ultralytics(detection)
-
-            # Convert goalkeeper class to player
-            for i, cls_id in enumerate(detection_supervision.class_id):
-                if cls_names[cls_id] == "goalkeeper":
-                    detection_supervision.class_id[i] = cls_names_inv["player"]
-
-            tracked_detections = self.tracker.update_with_detections(
-                detection_supervision
-            )
-
-            tracks["players"].append({})
-            tracks["referees"].append({})
-            tracks["ball"].append({})
-
-            for det in tracked_detections:
-                bbox = det[0].tolist()
-                cls_id = det[3]
-                track_id = det[4]
-
-                if cls_id == cls_names_inv["player"]:
-                    tracks["players"][frame_num][track_id] = {"bbox": bbox}
-                elif cls_id == cls_names_inv["referee"]:
-                    tracks["referees"][frame_num][track_id] = {"bbox": bbox}
-
-            for det in detection_supervision:
-                bbox = det[0].tolist()
-                cls_id = det[3]
-                if cls_id == cls_names_inv["ball"]:
-                    tracks["ball"][frame_num][1] = {"bbox": bbox}
-
-        return tracks
 
     def draw_ellipse(self, frame, bbox, color, track_id=None):
         y2 = int(bbox[3])
@@ -134,7 +135,6 @@ class Tracker:
                 (0, 0, 0),
                 2,
             )
-
         return frame
 
     def draw_traingle(self, frame, bbox, color):
@@ -155,8 +155,6 @@ class Tracker:
 
     def draw_team_ball_control(self, frame, frame_num, team_ball_control):
         h, w, _ = frame.shape
-
-        # Dynamic box position based on frame size
         x1, y1 = int(0.7 * w), int(0.85 * h)
         x2, y2 = int(0.98 * w), int(0.98 * h)
 
@@ -190,7 +188,7 @@ class Tracker:
 
         return frame
 
-    def draw_annotations(self, video_frames, tracks, team_ball_control):
+    def draw_annotations(self, video_frames, tracks, team_ball_control, team_assigner):
         output_frames = []
 
         for frame_num, frame in enumerate(video_frames):
@@ -201,11 +199,19 @@ class Tracker:
             referee_dict = tracks["referees"][frame_num]
 
             for track_id, player in player_dict.items():
-                color = player.get("team_color", (0, 0, 255))
-                frame = self.draw_ellipse(frame, player["bbox"], color, track_id)
+                bbox = player["bbox"]
+
+                # Assign team with smoothing
+                team_id = team_assigner.get_player_team(frame, bbox, player_id=track_id)
+                color = team_assigner.team_colors.get(team_id, (0, 0, 255))
+                player["team"] = team_id
+                player["team_color"] = color
+
+                # Draw player ellipse and ID
+                frame = self.draw_ellipse(frame, bbox, color, track_id)
 
                 if player.get("has_ball", False):
-                    frame = self.draw_traingle(frame, player["bbox"], (0, 0, 255))
+                    frame = self.draw_traingle(frame, bbox, (0, 0, 255))
 
             for _, referee in referee_dict.items():
                 frame = self.draw_ellipse(frame, referee["bbox"], (0, 255, 255))
